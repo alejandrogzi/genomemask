@@ -322,7 +322,7 @@ fn mask_selenocysteines(
     Ok(resolved_sites.len() as u64)
 }
 
-/// Resolves a BED3 site to an actual TGA codon in the sequence.
+/// Resolves a BED3 site to an actual TGA, TAG, or TAA codon in the sequence.
 ///
 /// Tries exact position first, then -1 and +1 shifts.
 /// Returns error if site is ambiguous (multiple TGA matches).
@@ -339,7 +339,7 @@ fn resolve_site(sequence: &[u8], header: &[u8], site: &SelenoSite) -> Result<Res
         )));
     }
 
-    if is_tga(&sequence[site.start..site.end]) {
+    if is_stop_codon(&sequence[site.start..site.end]) {
         return Ok(ResolvedSite {
             start: site.start,
             end: site.end,
@@ -353,7 +353,7 @@ fn resolve_site(sequence: &[u8], header: &[u8], site: &SelenoSite) -> Result<Res
     for shift in [-1isize, 1isize] {
         if let Some(start) = shift_start(site.start, shift) {
             let end = start.saturating_add(3);
-            if end <= sequence.len() && is_tga(&sequence[start..end]) {
+            if end <= sequence.len() && is_stop_codon(&sequence[start..end]) {
                 shifted_matches.push((start, end, shift));
             }
         }
@@ -484,16 +484,8 @@ fn codon_display(codon: Option<&[u8]>) -> String {
         .unwrap_or_else(|| "out-of-bounds".to_string())
 }
 
-/// Checks if a codon is TGA (case-insensitive).
-fn is_tga(codon: &[u8]) -> bool {
-    codon.len() == 3
-        && codon[0].eq_ignore_ascii_case(&b'T')
-        && codon[1].eq_ignore_ascii_case(&b'G')
-        && codon[2].eq_ignore_ascii_case(&b'A')
-}
-
 /// Checks if a codon is a stop codon (TAA, TAG, or TGA).
-fn is_stop_codon(codon: &[u8; 3]) -> bool {
+fn is_stop_codon(codon: &[u8]) -> bool {
     matches!(codon, b"TAA" | b"TAG" | b"TGA")
 }
 
