@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["Alejandro Gonzales-Irribarren <alejandrxgzi@gmail.com>"]
 license = "Apache-2.0"
 description = "mask specific regions of a genome in any format"
+keywords = ["mask", "fasta", "genome", "2bit"]
+homepage = "https://github.com/alejandrogzi/genomemask"
+repository = "https://github.com/alejandrogzi/genomemask"
+categories = ["command-line-utilities", "science"]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
