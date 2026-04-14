@@ -1,0 +1,23 @@
+[package]
+name = "genomemask"
+version = "0.0.1"
+edition = "2021"
+authors = ["Alejandro Gonzales-Irribarren <alejandrxgzi@gmail.com>"]
+license = "Apache-2.0"
+description = "mask specific regions of a genome in any format"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+flate2 = "1.1.2"
+genepred = { version = "0.0.11", features = ["mmap"] }
+log = "0.4"
+memmap2 = "0.9.4"
+num_cpus = "1.16.0"
+rayon = "1.8.1"
+simple_logger = "5.2.0"
+twobit = "0.2.2"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
