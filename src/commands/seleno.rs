@@ -2,7 +2,7 @@
 // Distributed under the terms of the Apache License, Version 2.0.
 
 use genepred::{Bed3, Reader};
-use log::info;
+use log::{info, warn};
 use std::{collections::HashMap, path::Path};
 
 use crate::{
@@ -85,12 +85,13 @@ impl SiteIndex {
             }
 
             if end - start != 3 {
-                return Err(GenomeMaskError::InvalidBed(format!(
-                    "BED3 record {}:{}-{} must span exactly 3 bases",
+                warn!(
+                    "skipping BED3 record {}:{}-{}: interval is not length 3",
                     String::from_utf8_lossy(record.chrom()),
                     record.start(),
                     record.end()
-                )));
+                );
+                continue;
             }
 
             by_chrom
@@ -107,16 +108,23 @@ impl SiteIndex {
         for sites in by_chrom.values_mut() {
             sites.sort_by_key(|site| (site.start, site.end));
 
-            for pair in sites.windows(2) {
-                if pair[0].start == pair[1].start && pair[0].end == pair[1].end {
-                    return Err(GenomeMaskError::InvalidBed(format!(
-                        "duplicate BED3 entry for {}:{}-{}",
-                        String::from_utf8_lossy(&pair[0].chrom),
-                        pair[0].start,
-                        pair[0].end
-                    )));
+            let mut deduped = Vec::with_capacity(sites.len());
+            for site in std::mem::take(sites) {
+                if deduped.last().is_some_and(|last: &SelenoSite| {
+                    last.start == site.start && last.end == site.end
+                }) {
+                    warn!(
+                        "skipping duplicate BED3 entry for {}:{}-{} (line {})",
+                        String::from_utf8_lossy(&site.chrom),
+                        site.start,
+                        site.end,
+                        site.line_number
+                    );
+                } else {
+                    deduped.push(site);
                 }
             }
+            *sites = deduped;
         }
 
         Ok(Self { by_chrom })
@@ -129,35 +137,25 @@ impl SiteIndex {
             .unwrap_or_default()
     }
 
-    /// Ensures all sites were consumed (matched to genome records).
+    /// Warns about any sites that were never matched to a genome record.
     ///
-    /// # Returns
-    /// * `Ok(())` - All sites consumed
-    /// * `Err(GenomeMaskError)` - Some sites not found in genome
-    fn ensure_consumed(&self) -> Result<()> {
+    /// Sites whose chromosome was absent from the genome (e.g. unplaced scaffolds)
+    /// are reported as warnings and silently skipped rather than aborting.
+    fn ensure_consumed(&self) {
         if self.by_chrom.is_empty() {
-            return Ok(());
+            return;
         }
 
-        let mut unresolved: Vec<String> = self
-            .by_chrom
-            .iter()
-            .map(|(chrom, sites)| {
-                let first = &sites[0];
-                format!(
-                    "{}:{}-{}",
-                    String::from_utf8_lossy(chrom),
-                    first.start,
-                    first.end
-                )
-            })
-            .collect();
-        unresolved.sort();
-
-        Err(GenomeMaskError::InvalidSelenocysteine(format!(
-            "the following BED3 sites were not found in the genome headers: {}",
-            unresolved.join(", ")
-        )))
+        let mut chroms: Vec<&Vec<u8>> = self.by_chrom.keys().collect();
+        chroms.sort();
+        for chrom in chroms {
+            let sites = &self.by_chrom[chrom];
+            warn!(
+                "chromosome '{}' not found in genome: skipping {} BED3 site(s)",
+                String::from_utf8_lossy(chrom),
+                sites.len()
+            );
+        }
     }
 
     #[cfg(test)]
@@ -244,7 +242,8 @@ impl RecordTransformer for SelenoTransformer {
     }
 
     fn finish(&mut self) -> Result<()> {
-        self.site_index.ensure_consumed()
+        self.site_index.ensure_consumed();
+        Ok(())
     }
 }
 
@@ -339,7 +338,7 @@ fn resolve_site(sequence: &[u8], header: &[u8], site: &SelenoSite) -> Result<Res
         )));
     }
 
-    if is_stop_codon(&sequence[site.start..site.end]) {
+    if is_stop_codon_either_strand(&sequence[site.start..site.end]) {
         return Ok(ResolvedSite {
             start: site.start,
             end: site.end,
@@ -353,7 +352,7 @@ fn resolve_site(sequence: &[u8], header: &[u8], site: &SelenoSite) -> Result<Res
     for shift in [-1isize, 1isize] {
         if let Some(start) = shift_start(site.start, shift) {
             let end = start.saturating_add(3);
-            if end <= sequence.len() && is_stop_codon(&sequence[start..end]) {
+            if end <= sequence.len() && is_stop_codon_either_strand(&sequence[start..end]) {
                 shifted_matches.push((start, end, shift));
             }
         }
@@ -368,7 +367,7 @@ fn resolve_site(sequence: &[u8], header: &[u8], site: &SelenoSite) -> Result<Res
             original_end: site.end,
         }),
         [] => Err(GenomeMaskError::InvalidSelenocysteine(format!(
-            "BED3 line {} for {}:{}-{} did not resolve to TGA on record '{}' (exact={}, -1={}, +1={})",
+            "BED3 line {} for {}:{}-{} did not resolve to a stop codon on either strand for record '{}' (exact={}, -1={}, +1={})",
             site.line_number,
             String::from_utf8_lossy(&site.chrom),
             site.start,
@@ -379,7 +378,7 @@ fn resolve_site(sequence: &[u8], header: &[u8], site: &SelenoSite) -> Result<Res
             shifted_display(sequence, site.start, 1),
         ))),
         _ => Err(GenomeMaskError::InvalidSelenocysteine(format!(
-            "BED3 line {} for {}:{}-{} is ambiguous on record '{}' because both +/-1 resolve to TGA",
+            "BED3 line {} for {}:{}-{} is ambiguous on record '{}' because both +/-1 resolve to a stop codon on either strand",
             site.line_number,
             String::from_utf8_lossy(&site.chrom),
             site.start,
@@ -484,9 +483,45 @@ fn codon_display(codon: Option<&[u8]>) -> String {
         .unwrap_or_else(|| "out-of-bounds".to_string())
 }
 
-/// Checks if a codon is a stop codon (TAA, TAG, or TGA).
+/// Checks if a codon is a stop codon (TAA, TAG, or TGA), case-insensitively.
 fn is_stop_codon(codon: &[u8]) -> bool {
-    matches!(codon, b"TAA" | b"TAG" | b"TGA")
+    codon.len() == 3
+        && matches!(
+            [
+                codon[0].to_ascii_uppercase(),
+                codon[1].to_ascii_uppercase(),
+                codon[2].to_ascii_uppercase(),
+            ],
+            [b'T', b'A', b'A'] | [b'T', b'A', b'G'] | [b'T', b'G', b'A']
+        )
+}
+
+/// Returns the uppercase DNA complement of a single base.
+fn complement(base: u8) -> u8 {
+    match base.to_ascii_uppercase() {
+        b'A' => b'T',
+        b'T' => b'A',
+        b'G' => b'C',
+        b'C' => b'G',
+        other => other,
+    }
+}
+
+/// Returns the reverse complement of a 3-base codon (always uppercase).
+fn rev_comp_codon(codon: [u8; 3]) -> [u8; 3] {
+    [
+        complement(codon[2]),
+        complement(codon[1]),
+        complement(codon[0]),
+    ]
+}
+
+/// Checks if a codon is a stop codon on either the forward or reverse-complement strand.
+fn is_stop_codon_either_strand(codon: &[u8]) -> bool {
+    if codon.len() != 3 {
+        return false;
+    }
+    is_stop_codon(codon) || is_stop_codon(&rev_comp_codon([codon[0], codon[1], codon[2]]))
 }
 
 /// SplitMix64 PRNG for deterministic stochastic selection.
@@ -560,5 +595,160 @@ mod tests {
             .expect("mask sites");
 
         assert!(!matches!(sequence.as_slice(), b"TAA" | b"TAG" | b"TGA"));
+    }
+
+    // --- non-length-3: warn and skip ---
+
+    #[test]
+    fn non_length_3_record_is_skipped_not_an_error() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("genomemask_test_non3.bed");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "chr1\t100\t104").unwrap(); // length 4 — should be skipped
+            writeln!(f, "chr1\t200\t203").unwrap(); // length 3 — kept
+        }
+        let index = SiteIndex::from_bed3(&path).expect("non-length-3 should not be an error");
+        let sites = index.by_chrom.get(b"chr1".as_slice()).map(|v| v.len());
+        assert_eq!(sites, Some(1), "only the length-3 record should be kept");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn non_length_3_only_record_yields_empty_index() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("genomemask_test_non3_only.bed");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "chr1\t100\t106").unwrap(); // length 6 — skipped
+        }
+        let index = SiteIndex::from_bed3(&path).expect("non-length-3 should not be an error");
+        assert!(index.by_chrom.is_empty(), "no valid records should remain");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- duplicates: warn and deduplicate ---
+
+    #[test]
+    fn duplicate_entries_are_deduplicated_not_an_error() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("genomemask_test_dup.bed");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "chr1\t100\t103").unwrap();
+            writeln!(f, "chr1\t100\t103").unwrap(); // duplicate
+            writeln!(f, "chr1\t200\t203").unwrap();
+        }
+        let index = SiteIndex::from_bed3(&path).expect("duplicates should not be an error");
+        let count = index.by_chrom.get(b"chr1".as_slice()).map(|v| v.len());
+        assert_eq!(
+            count,
+            Some(2),
+            "duplicate should be dropped, leaving 2 unique sites"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn three_copies_reduce_to_one() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("genomemask_test_dup3.bed");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for _ in 0..3 {
+                writeln!(f, "chr1\t50\t53").unwrap();
+            }
+        }
+        let index = SiteIndex::from_bed3(&path).expect("triplicate should not be an error");
+        let count = index.by_chrom.get(b"chr1".as_slice()).map(|v| v.len());
+        assert_eq!(count, Some(1), "only one copy should survive deduplication");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- two-strand stop codon validation ---
+
+    #[test]
+    fn is_stop_codon_either_strand_forward() {
+        assert!(is_stop_codon_either_strand(b"TGA"));
+        assert!(is_stop_codon_either_strand(b"TAA"));
+        assert!(is_stop_codon_either_strand(b"TAG"));
+        // soft-masked (lowercase) — is_stop_codon normalizes to uppercase
+        assert!(is_stop_codon_either_strand(b"tga"));
+        assert!(is_stop_codon_either_strand(b"taa"));
+        assert!(is_stop_codon_either_strand(b"tag"));
+        // mixed case (e.g. TgA)
+        assert!(is_stop_codon_either_strand(b"TgA"));
+        assert!(is_stop_codon_either_strand(b"tAg"));
+    }
+
+    #[test]
+    fn unresolved_chromosome_does_not_error() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join("genomemask_test_unresolved.bed");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "chrUn_scaffold42\t0\t3").unwrap();
+        }
+        // Loading succeeds
+        let mut transformer =
+            SelenoTransformer::from_bed3(&path, ReplacementSpec::Fixed(b'N')).unwrap();
+        // Processing a different chromosome produces no events
+        let mut seq = b"ATGTGA".to_vec();
+        let count = transformer
+            .transform_record(b"chr1", &mut seq, 0)
+            .expect("unrelated record should process cleanly");
+        assert_eq!(count, 0);
+        // finish() should not error even though chrUn_scaffold42 was never seen
+        transformer
+            .finish()
+            .expect("unresolved chromosome should only warn, not error");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn is_stop_codon_either_strand_reverse_complement() {
+        // rc(TGA) = TCA, rc(TAA) = TTA, rc(TAG) = CTA
+        assert!(is_stop_codon_either_strand(b"TCA"));
+        assert!(is_stop_codon_either_strand(b"TTA"));
+        assert!(is_stop_codon_either_strand(b"CTA"));
+    }
+
+    #[test]
+    fn is_stop_codon_either_strand_non_stop() {
+        assert!(!is_stop_codon_either_strand(b"ATG"));
+        assert!(!is_stop_codon_either_strand(b"GGG"));
+        assert!(!is_stop_codon_either_strand(b"CCC"));
+    }
+
+    #[test]
+    fn reverse_complement_stop_codon_is_masked() {
+        // TCA is rc(TGA), so a BED record pointing to TCA should be accepted and masked
+        let mut sequence = b"CCCTCA".to_vec();
+        let mut transformer =
+            SelenoTransformer::from_sites(&[("chr1", 3, 6)], ReplacementSpec::Fixed(b'N'));
+
+        let count = transformer
+            .transform_record(b"chr1", &mut sequence, 0)
+            .expect("reverse-complement stop codon should be accepted");
+
+        assert_eq!(count, 1);
+        assert_eq!(sequence, b"CCCNNN");
+    }
+
+    #[test]
+    fn forward_and_reverse_stop_codons_coexist() {
+        // TAA at 0..3 (forward), TCA at 3..6 (rc of TGA)
+        let mut sequence = b"TAATCA".to_vec();
+        let mut transformer = SelenoTransformer::from_sites(
+            &[("chr1", 0, 3), ("chr1", 3, 6)],
+            ReplacementSpec::Fixed(b'G'),
+        );
+
+        let count = transformer
+            .transform_record(b"chr1", &mut sequence, 0)
+            .expect("mixed forward/reverse stop codons should be accepted");
+
+        assert_eq!(count, 2);
+        assert_eq!(sequence, b"GGGGGG");
     }
 }
