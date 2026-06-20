@@ -97,11 +97,12 @@ pub fn process_input_to_fasta<T: RecordTransformer, W: Write>(
     input: &Path,
     writer: &mut W,
     transformer: &mut T,
+    preserve_mask: bool,
 ) -> Result<ProcessStats> {
     let stats = if is_stdio_path(input) {
-        process_stdin_to_fasta(writer, transformer)?
+        process_stdin_to_fasta(writer, transformer, preserve_mask)?
     } else {
-        process_file_to_fasta(input, writer, transformer)?
+        process_file_to_fasta(input, writer, transformer, preserve_mask)?
     };
 
     transformer.finish()?;
@@ -138,6 +139,7 @@ pub fn is_twobit_input_path(input: &Path) -> Result<bool> {
 fn process_stdin_to_fasta<T: RecordTransformer, W: Write>(
     writer: &mut W,
     transformer: &mut T,
+    preserve_mask: bool,
 ) -> Result<ProcessStats> {
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -156,10 +158,10 @@ fn process_stdin_to_fasta<T: RecordTransformer, W: Write>(
     };
 
     match format {
-        InputFormat::Fasta => process_fasta_reader(reader, writer, transformer),
+        InputFormat::Fasta => process_fasta_reader(reader, writer, transformer, preserve_mask),
         InputFormat::GzipFasta => {
             let decoder = MultiGzDecoder::new(reader);
-            process_fasta_reader(BufReader::new(decoder), writer, transformer)
+            process_fasta_reader(BufReader::new(decoder), writer, transformer, preserve_mask)
         }
         InputFormat::TwoBit => {
             let mut data = Vec::new();
@@ -171,7 +173,7 @@ fn process_stdin_to_fasta<T: RecordTransformer, W: Write>(
                     GenomeMaskError::InvalidTwoBit(format!("cannot read 2bit stdin: {err}"))
                 })?
                 .enable_softmask(true);
-            process_twobit_reader(genome, writer, transformer)
+            process_twobit_reader(genome, writer, transformer, preserve_mask)
         }
     }
 }
@@ -199,6 +201,7 @@ fn process_file_to_fasta<T: RecordTransformer, W: Write>(
     input: &Path,
     writer: &mut W,
     transformer: &mut T,
+    preserve_mask: bool,
 ) -> Result<ProcessStats> {
     let probe = read_probe(input)?;
     if probe.is_empty() {
@@ -211,7 +214,7 @@ fn process_file_to_fasta<T: RecordTransformer, W: Write>(
                 GenomeMaskError::io(format!("cannot open {}", input.display()), err)
             })?;
             let decoder = MultiGzDecoder::new(file);
-            process_fasta_reader(BufReader::new(decoder), writer, transformer)
+            process_fasta_reader(BufReader::new(decoder), writer, transformer, preserve_mask)
         }
         Some(InputFormat::TwoBit) => {
             let genome = TwoBitFile::open(input)
@@ -222,7 +225,7 @@ fn process_file_to_fasta<T: RecordTransformer, W: Write>(
                     ))
                 })?
                 .enable_softmask(true);
-            process_twobit_reader(genome, writer, transformer)
+            process_twobit_reader(genome, writer, transformer, preserve_mask)
         }
         Some(InputFormat::Fasta) | None => {
             let file = File::open(input).map_err(|err| {
@@ -236,6 +239,7 @@ fn process_file_to_fasta<T: RecordTransformer, W: Write>(
                     BufReader::new(Cursor::new(&mmap[..])),
                     writer,
                     transformer,
+                    preserve_mask,
                 ),
                 Some(InputFormat::GzipFasta) => Err(GenomeMaskError::UnsupportedInput(format!(
                     "unexpected gzipped data in plain FASTA path {}",
@@ -276,6 +280,7 @@ fn process_fasta_reader<R: BufRead, T: RecordTransformer, W: Write>(
     mut reader: R,
     writer: &mut W,
     transformer: &mut T,
+    preserve_mask: bool,
 ) -> Result<ProcessStats> {
     let mut line = Vec::new();
     let mut header: Option<Vec<u8>> = None;
@@ -305,6 +310,7 @@ fn process_fasta_reader<R: BufRead, T: RecordTransformer, W: Write>(
                     writer,
                     transformer,
                     &mut stats,
+                    preserve_mask,
                 )?;
             }
         } else {
@@ -327,7 +333,14 @@ fn process_fasta_reader<R: BufRead, T: RecordTransformer, W: Write>(
 
     match header {
         Some(last_header) => {
-            emit_record(last_header, &mut sequence, writer, transformer, &mut stats)?;
+            emit_record(
+                last_header,
+                &mut sequence,
+                writer,
+                transformer,
+                &mut stats,
+                preserve_mask,
+            )?;
             Ok(stats)
         }
         None => Err(GenomeMaskError::EmptyInput),
@@ -356,6 +369,7 @@ fn process_twobit_reader<R: Read + Seek, T: RecordTransformer, W: Write>(
     mut genome: TwoBitFile<R>,
     writer: &mut W,
     transformer: &mut T,
+    preserve_mask: bool,
 ) -> Result<ProcessStats> {
     let chrom_names = genome.chrom_names();
     if chrom_names.is_empty() {
@@ -376,7 +390,7 @@ fn process_twobit_reader<R: Read + Seek, T: RecordTransformer, W: Write>(
             .into_bytes();
 
         let events = transformer.transform_record(&header, &mut sequence, stats.records)?;
-        write_fasta_record(writer, &header, &sequence)?;
+        write_fasta_record(writer, &header, &sequence, preserve_mask)?;
         stats.add_record(events);
     }
 
@@ -405,9 +419,10 @@ fn emit_record<T: RecordTransformer, W: Write>(
     writer: &mut W,
     transformer: &mut T,
     stats: &mut ProcessStats,
+    preserve_mask: bool,
 ) -> Result<()> {
     let events = transformer.transform_record(&header, sequence, stats.records)?;
-    write_fasta_record(writer, &header, sequence)?;
+    write_fasta_record(writer, &header, sequence, preserve_mask)?;
     sequence.clear();
     stats.add_record(events);
     Ok(())
@@ -419,14 +434,48 @@ fn emit_record<T: RecordTransformer, W: Write>(
 /// * `writer` - Output writer
 /// * `header` - FASTA header (without >)
 /// * `sequence` - Sequence data
-pub fn write_fasta_record<W: Write>(writer: &mut W, header: &[u8], sequence: &[u8]) -> Result<()> {
+pub fn write_fasta_record<W: Write>(
+    writer: &mut W,
+    header: &[u8],
+    sequence: &[u8],
+    preserve_mask: bool,
+) -> Result<()> {
     writer
         .write_all(b">")
         .and_then(|_| writer.write_all(header))
         .and_then(|_| writer.write_all(b"\n"))
-        .and_then(|_| writer.write_all(sequence))
+        .and_then(|_| {
+            if preserve_mask {
+                writer.write_all(sequence)
+            } else {
+                writer.write_all(sequence.to_ascii_uppercase().as_slice())
+            }
+        })
         .and_then(|_| writer.write_all(b"\n"))
         .map_err(|err| GenomeMaskError::io("cannot write FASTA output", err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fasta_writer_normalizes_lowercase_bases_by_default() {
+        let mut output = Vec::new();
+
+        write_fasta_record(&mut output, b"chr1", b"ACgtNn", false).expect("write FASTA");
+
+        assert_eq!(output, b">chr1\nACGTNN\n");
+    }
+
+    #[test]
+    fn fasta_writer_preserves_lowercase_bases_when_requested() {
+        let mut output = Vec::new();
+
+        write_fasta_record(&mut output, b"chr1", b"ACgtNn", true).expect("write FASTA");
+
+        assert_eq!(output, b">chr1\nACgtNn\n");
+    }
 }
 
 /// Reads a probe file to determine input format.

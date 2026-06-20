@@ -127,7 +127,12 @@ fn run_to_fasta<T: RecordTransformer>(
     );
 
     let mut writer = OutputWriter::new(&common.output_target, common.gzip)?;
-    let stats = process_input_to_fasta(&common.sequence, &mut writer, transformer)?;
+    let stats = process_input_to_fasta(
+        &common.sequence,
+        &mut writer,
+        transformer,
+        common.preserve_mask,
+    )?;
     writer.finish()?;
     log_summary(stats, verb, unit);
     Ok(())
@@ -185,7 +190,12 @@ fn run_to_twobit_with_temp<T: RecordTransformer>(
     );
 
     let mut temp_writer = BufWriter::new(temp_file);
-    let stats = process_input_to_fasta(&common.sequence, &mut temp_writer, transformer)?;
+    let stats = process_input_to_fasta(
+        &common.sequence,
+        &mut temp_writer,
+        transformer,
+        common.preserve_mask,
+    )?;
     temp_writer.flush().map_err(|err| {
         crate::error::GenomeMaskError::io(format!("cannot flush {}", temp_path.display()), err)
     })?;
@@ -274,6 +284,9 @@ fn run_to_twobit_from_twobit_input_with_store<T: RecordTransformer>(
             .into_bytes();
 
         let events = transformer.transform_record(&header, &mut sequence, stats.records)?;
+        if !common.preserve_mask {
+            sequence.make_ascii_uppercase();
+        }
         let mut record = analyze_sequence_for_twobit(&header, &sequence)?;
         record.sequence_start = sequence_start;
 
@@ -365,7 +378,7 @@ mod tests {
             .expect("open 2bit")
             .enable_softmask(true);
         let sequence = genome.read_sequence("chr1", ..).expect("read chr1");
-        assert_eq!(sequence, "ACGgTG");
+        assert_eq!(sequence, "ACGGTG");
 
         fs::remove_dir_all(&temp_dir).expect("remove temp dir");
     }
@@ -418,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn app_writes_twobit_output_from_twobit_input_without_fasta_roundtrip() {
+    fn app_normalizes_twobit_softmask_unless_preserved_without_fasta_roundtrip() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -452,6 +465,34 @@ mod tests {
             "2bit",
             "--nucleotide",
             "G",
+        ])
+        .expect("parse args");
+
+        run(args.command).expect("run app");
+
+        let mut genome = TwoBitFile::open(&output_twobit)
+            .expect("open 2bit")
+            .enable_softmask(true);
+        let sequence = genome.read_sequence("chr1", ..).expect("read chr1");
+        assert_eq!(sequence, "ACGGTG");
+        drop(genome);
+
+        let args = Args::try_parse_from([
+            "genomemask",
+            "--threads",
+            "1",
+            "--level",
+            "info",
+            "ns",
+            "--sequence",
+            input_twobit.to_str().expect("input path"),
+            "--outdir",
+            temp_dir.to_str().expect("temp dir"),
+            "--output-format",
+            "2bit",
+            "--nucleotide",
+            "G",
+            "--preserve-mask",
         ])
         .expect("parse args");
 

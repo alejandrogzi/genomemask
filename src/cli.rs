@@ -93,6 +93,7 @@ pub struct CommonConfig {
     pub output_target: OutputTarget,
     pub replacement_spec: ReplacementSpec,
     pub gzip: bool,
+    pub preserve_mask: bool,
 }
 
 /// Configuration for the `ns` command.
@@ -332,6 +333,14 @@ pub struct CommonCommandArgs {
         action = ArgAction::SetTrue
     )]
     pub gzip: bool,
+
+    #[arg(
+        short = 'P',
+        long = "preserve-mask",
+        help = "Preserve lowercase bases in output",
+        action = ArgAction::SetTrue
+    )]
+    pub preserve_mask: bool,
 }
 
 impl CommonCommandArgs {
@@ -368,6 +377,7 @@ impl CommonCommandArgs {
                 &self.outdir,
                 self.output_format,
                 self.gzip,
+                self.preserve_mask,
             )?),
         };
 
@@ -377,6 +387,7 @@ impl CommonCommandArgs {
             output_target,
             replacement_spec,
             gzip: self.gzip,
+            preserve_mask: self.preserve_mask,
         })
     }
 }
@@ -431,6 +442,7 @@ fn derive_output_path(
     outdir: &Path,
     format: OutputFormat,
     gzip: bool,
+    _preserve_mask: bool,
 ) -> Result<PathBuf> {
     let stem = if is_stdio_path(input) {
         "stdin"
