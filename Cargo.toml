@@ -1,6 +1,6 @@
 [package]
 name = "genomemask"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 authors = ["Alejandro Gonzales-Irribarren <alejandrxgzi@gmail.com>"]
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "science"]
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 flate2 = "1.1.2"
-genepred = { version = "0.0.11", features = ["mmap"] }
+genepred = { version = "0.0.15", features = ["mmap"] }
 log = "0.4"
 memmap2 = "0.9.4"
 num_cpus = "1.16.0"
